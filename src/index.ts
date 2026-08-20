@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { startProxy } from './proxy.js';
+import { decideFault, type FaultConfig } from './fault-engine.js';
+import { log } from './log.js';
+import { Recorder } from './recorder.js';
+
+const recorder = new Recorder();
 
 // Prints a message & exists with code 2 (config/usage-error code)
 // Returns: Never returns
@@ -41,7 +46,29 @@ if (Number.isNaN(port)) {
     fail(`Invalid --port: ${values.port}`);
 }
 
+function parseOptionalNumber(raw: string | undefined, flagName: string): number | undefined {
+    if (raw === undefined) return undefined;
+    const n = Number(raw);
+    if (Number.isNaN(n)) {
+        fail(`Invalid ${flagName}: ${raw}`);
+    }
+    return n;
+}
 
-console.log(`target: ${values.target} port: ${port} latency: ${values.latency} fail-rate: ${values['fail-rate']} fail-status: ${values['fail-status']}`);
-// startProxy(values.target, port);
+const faultConfig: FaultConfig = {
+    latency: parseOptionalNumber(values.latency, '--latency'),
+    failRate: parseOptionalNumber(values['fail-rate'], '--fail-rate'),
+    failStatus: parseOptionalNumber(values['fail-status'], '--fail-status'),
+};
+
+
+// console.log(`target: ${values.target} port: ${port} latency: ${values.latency} fail-rate: ${values['fail-rate']} fail-status: ${values['fail-status']}`);
+// startProxy(values.target, port, faultConfig;
 // console.log(`shipwreck: ${port} -> ${values.target}`);
+log.info('cli.config.parsed', {
+    target: values.target,
+    port: values.port,
+    ...faultConfig
+});
+
+startProxy(values.target, port, (req) => decideFault(faultConfig), recorder);
