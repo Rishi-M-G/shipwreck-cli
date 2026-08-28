@@ -72,3 +72,8 @@ log.info('cli.config.parsed', {
 });
 
 startProxy(values.target, port, (req) => decideFault(faultConfig), recorder);
+
+process.on('SIGINT', () => {
+    log.info('recorder.dump', { count: recorder.all().length, records: recorder.all() });
+    process.exit(0);
+});

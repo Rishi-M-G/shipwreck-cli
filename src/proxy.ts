@@ -77,13 +77,18 @@ async function forward(req: IncomingMessage, res: ServerResponse, target: string
         outboundUrl,
         { method: req.method, headers: outboundHeaders },
         (proxyRes) => {
-            res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+            const status = proxyRes.statusCode ?? 502;
+            res.writeHead(status, proxyRes.headers);
             proxyRes.pipe(res);
             log.info('proxy.request.forwarded', {
                 method: req.method,
                 path: req.url,
-                status: proxyRes.statusCode,
+                status: status,
                 durationMs: Date.now() - startedAt,
+            });
+            recorder.complete(id, {
+                status,
+                durationMs: Date.now() - startedAt
             });
         },
     );
