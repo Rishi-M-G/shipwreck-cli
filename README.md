@@ -7,8 +7,8 @@ faults, and then **grades how the application responded**. It produces a pass/fa
 report and a non-zero exit code on failure, so it can gate a CI pipeline.
 
 > **Status: in active development. Phase 0 of 6.**
-> This is not installable yet. There is no published package and no working proxy.
-> See [PROGRESS.md](./PROGRESS.md) for the dated build log.
+> This is not installable yet. The command-line interface parses and validates its arguments, but
+> the proxy itself is not built. See [PROGRESS.md](./PROGRESS.md) for the dated build log.
 
 ---
 
@@ -71,6 +71,28 @@ assertions are the product.
 Every result carries **evidence** — the specific recorded requests that support the verdict. A
 report that says "fail" without showing why is a report nobody trusts.
 
+## Command-line interface
+
+This section documents what is actually implemented, not what is planned.
+
+```
+shipwreck --target <backend-url> [--port <number>]
+```
+
+| Flag | Required | Default | Rules |
+|---|---|---|---|
+| `--target` | yes | — | Must parse as a URL, use an `http:` or `https:` scheme, and be a bare origin with no path, query or fragment. |`--port` | no | `4000` | Must be an integer between 1 and 65535. |
+
+**The target must be a bare origin.** `--target http://localhost:8080` is valid; a trailing slash is
+fine. A path, query string or fragment is rejected, because your client already sends the path and a
+proxy that rewrites paths is no longer transparent — the path your app sent would stop being the path
+your backend received. If your API lives under a prefix, keep the prefix in your client's base URL
+and point that base URL at shipwreck: `http://localhost:4000/api`.
+
+Anything that fails validation produces a single-sentence message on **stderr** and exit code `2`.
+No failure path prints a stack trace. The full set of cases the CLI is checked against lives in
+`check.ps1` at the repository root.
+
 ## Honest limits
 
 These are stated up front on purpose. A tool that claims certainty it does not have is a tool a
@@ -102,17 +124,21 @@ The payoff is that `shipwreck run scenario.ts && deploy` only deploys when resil
 
 ## Technical decisions
 
-- **TypeScript, strict mode.** The package will ship its own type definitions.
+- **TypeScript, strict mode.** The package will ship its own type definitions. `any` is treated as a
+  defect rather than a shortcut, because it switches off checking for everything downstream of it.
 - **Node built-ins first.** `node:http` for the proxy core, `node:util`'s `parseArgs` for arguments,
   `node:crypto` for hashing. Every dependency in a security-adjacent tool is a supply-chain surface,
   and a lean dependency tree is itself a selling point. A dependency gets added only when
-  hand-rolling is genuinely worse.
+  hand-rolling is genuinely worse. There are currently **zero runtime dependencies**.
 - **ESM**, Node 20 or newer.
 - **Vitest** for tests. Integration tests spin up a throwaway target server inside the suite, so
   runs are deterministic and touch no real network.
 - **Fail soft.** An internal error in shipwreck must never crash the development loop it is sitting
   in front of. On error it logs loudly with a structured event and keeps forwarding. Fail soft means
   *degrade and shout*, never *degrade and hide*.
+- **Catch narrowly.** A `try` block holds the one call that can throw, never a whole function body.
+  A broad catch relabels the developer's own bugs as user errors and discards the stack trace that
+  would have located them.
 - **Structured logging throughout**, including shipwreck's own logs — event-name messages with named
   fields, such as `log.info('proxy.request.forwarded', { method, path, status, durationMs })`, never
   concatenated strings. This is a tool about observability discipline, so its own logs should be the
