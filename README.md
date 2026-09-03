@@ -7,8 +7,10 @@ faults, and then **grades how the application responded**. It produces a pass/fa
 report and a non-zero exit code on failure, so it can gate a CI pipeline.
 
 > **Status: in active development. Phase 0 of 6.**
-> This is not installable yet. The command-line interface parses and validates its arguments, but
-> the proxy itself is not built. See [PROGRESS.md](./PROGRESS.md) for the dated build log.
+> This is not installable yet. The command-line interface parses and validates its arguments, and
+> the forwarding proxy works end to end — traffic passes through it unchanged and every failure
+> path is logged. Fault injection, recording and the assertion engine are not built.
+> See [docs/PROGRESS.md](./docs/PROGRESS.md) for the dated build log.
 
 ---
 
@@ -71,6 +73,46 @@ assertions are the product.
 Every result carries **evidence** — the specific recorded requests that support the verdict. A
 report that says "fail" without showing why is a report nobody trusts.
 
+## What works today
+
+Steps 1, 4 and 6 of the pipeline above are implemented. Shipwreck forwards traffic transparently
+and reports every way that forwarding can fail.
+
+- The request method, path, body and headers are relayed to the target unchanged, except for the
+  `Host` header, which is rewritten to the target's host. Forwarding the browser's original `Host`
+  would break any backend that does virtual-host routing, generates absolute URLs, or validates the
+  origin.
+- Request and response bodies are **piped**, never buffered, so a large upload or download does not
+  accumulate in memory and backpressure is handled by the runtime.
+- Each of the four streams in a proxied exchange has its own error handler: the client's request,
+  the outbound request to the backend, the backend's response, and the response written back to the
+  client. Each fails independently and `pipe()` does not carry failures across the join, so each
+  needs its own.
+- When the client disconnects early, shipwreck destroys the outbound request so the backend stops
+  doing work nobody will read.
+- **Nothing in the request path can terminate the process.** An error handler may log, respond, and
+  close a connection. Exiting belongs to startup, where there is nothing yet to degrade to.
+
+### Log events emitted so far
+
+Every log line is an event name followed by named fields, never a concatenated string. These records
+are the input the assertion engine will read in Phase 3, so each event name means exactly one thing.
+
+| Event | Meaning | Fields |
+|---|---|---|
+| `proxy.listening` | The proxy bound its port | `port`, `target` |
+| `proxy.request.forwarded` | A request completed cleanly | `method`, `path`, `status`, `durationMs` |
+| `proxy.forward.failed` | The backend could not be reached or dropped the connection | `method`, `path`, `error` |
+| `proxy.forward.cancelled` | Shipwreck itself aborted the outbound request because the client left | `method`, `path`, `error` |
+| `proxy.response.failed` | The backend's response broke partway through | `method`, `path`, `error` |
+| `proxy.client.write_failed` | Writing the response back to the client failed | `method`, `path`, `error` |
+
+The distinction between `proxy.forward.failed` and `proxy.forward.cancelled` matters more than it
+looks. Both surface as `ECONNRESET` from the operating system, but one is the backend failing and
+the other is shipwreck deliberately cancelling. Conflating them would let an impatient client
+manufacture a phantom fault, and the assertion engine would grade the application on a failure
+shipwreck invented.
+
 ## Command-line interface
 
 This section documents what is actually implemented, not what is planned.
@@ -81,7 +123,8 @@ shipwreck --target <backend-url> [--port <number>]
 
 | Flag | Required | Default | Rules |
 |---|---|---|---|
-| `--target` | yes | — | Must parse as a URL, use an `http:` or `https:` scheme, and be a bare origin with no path, query or fragment. |`--port` | no | `4000` | Must be an integer between 1 and 65535. |
+| `--target` | yes | — | Must parse as a URL, use an `http:` or `https:` scheme, and be a bare origin with no path, query or fragment. |
+| `--port` | no | `4000` | Must be an integer between 1 and 65535. |
 
 **The target must be a bare origin.** `--target http://localhost:8080` is valid; a trailing slash is
 fine. A path, query string or fragment is rejected, because your client already sends the path and a
@@ -150,7 +193,7 @@ Each phase has a gate. The next phase does not begin until the current gate pass
 
 | Phase | Deliverable | Gate | Status |
 |---|---|---|---|
-| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | 🔧 in progress |
+| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | 🔧 in progress (0.1–0.3 done) |
 | 1 | Fault injection (latency, failure) | The flags visibly change application behaviour | ⬜ |
 | 2 | Request recording and fingerprinting | A duplicate POST is detected, and a non-duplicate is *not* flagged | ⬜ |
 | 3 | Scenario and assertion engine | One expectation gives a real pass on good traffic and a real fail on bad traffic | ⬜ |
