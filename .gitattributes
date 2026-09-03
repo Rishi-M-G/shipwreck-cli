@@ -1,0 +1,4 @@
+# Normalise all text files to LF in the repository.
+# Without this, Windows editors rewrite files as CRLF and every touched file
+# shows as 100% changed, which buries the real diff.
+* text=auto eol=lf

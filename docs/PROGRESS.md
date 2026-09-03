@@ -1,6 +1,6 @@
 # shipwreck — build log
 
-This file is written for me, not for anyone evaluating the project. The [README](./README.md)
+This file is written for me, not for anyone evaluating the project. The [README](../README.md)
 explains what shipwreck is to a stranger. This file records what I actually did, on which date, what
 I verified before believing it worked, and what I understood at the time.
 
@@ -16,11 +16,13 @@ get buried. Open questions live at the bottom of the file.
 - **Phase 0 — Scaffold and forwarding proxy**, in progress.
 - **Milestone 0.1 — Package setup: complete and verified** (1 September 2026).
 - **Milestone 0.2 — CLI arguments and validation: complete and verified** (3 September 2026).
-- **Next: Milestone 0.3 — the proxy core.** Stand up a `node:http` server on the listen port, open an
-  outbound request to the target for each incoming request, and pipe the bodies through in both
-  directions.
+- **Milestone 0.3 — The proxy core: complete and verified** (3 September 2026).
+- **Next: Milestone 0.4 — the real logger.** Replace the `console.log` and `console.error` calls in
+  `src/proxy.ts` with a small logging module that emits the same event-name-plus-fields shape, so
+  the format is defined in one place instead of repeated at every call site.
 - Phase 0's gate has not been reached yet. The gate is: my application runs normally through the
-  proxy, every request produces one structured log line, and nothing is broken.
+  proxy, every request produces one structured log line, and nothing is broken. That is Milestone
+  0.5, after the logger.
 
 ---
 
@@ -66,14 +68,32 @@ alone would let `http://localhost:8080?x=1` through.
 
 **What I nearly walked into, and why the check exists.** Under the prefix decision, the obvious
 forwarding code would have been silently wrong:
-new URL('/orders', 'http://localhost:8080/api') -> http://localhost:8080/orders
 
+```
+new URL('/orders', 'http://localhost:8080/api')  ->  http://localhost:8080/orders
+```
 
 The two-argument `URL(path, base)` form discards the base's path whenever the first argument begins
 with `/`, which `req.url` always does. It does not throw and does not warn — it returns a completely
 valid URL that is simply the wrong one. That is the same shape of trap as `Number('abc')` returning
 `NaN`. **A standard-library function doing something reasonable with my input is not the same as it
 doing what I meant.** Convenience APIs earn a quick test before I trust them.
+
+Confirmed at Milestone 0.3: because the target is guaranteed to be a bare origin,
+`new URL(req.url ?? '/', config.target)` is correct with no prefix concatenation anywhere.
+
+### 2026-09-03 — `fail()` in `config.ts` keeps its name
+
+I was offered a rename to `failUsage()`. The concern was real: a function named `fail` that calls
+`process.exit(2)` is dangerous to have in scope inside the request path, where exiting violates the
+fail-soft rule. I kept the name and removed the risk differently, by deleting the unused import of
+`fail` from `proxy.ts`. Nothing in the request path can now reach it. Settled — do not revisit.
+
+### 2026-09-03 — `PROGRESS.md` lives in `docs/`, deliberately
+
+This file is in `docs/`, not at the repository root. That is a choice, not drift. There is exactly
+one progress file in the repository.
+
 ---
 
 ## 2026-09-01 — Restart from zero
@@ -158,7 +178,7 @@ it to another. Nothing else in this phase — no faults, no recording.
 entirely. This milestone turns that into a typed configuration object, or refuses clearly and exits
 with the right code.
 
-**What I built**, all in `src/index.ts`:
+**What I built**, all in `src/config.ts` (it started in `index.ts` and moved out at Milestone 0.3):
 
 - `interface Config { target: URL, port: number }` — the boundary. Above it, values are
   `string | undefined` and untrusted. Below it, everything is present, typed and validated. Nothing
@@ -168,22 +188,23 @@ with the right code.
   (string, default `'4000'`), with a try/catch routing unknown flags into `fail`.
 - `parseTarget(raw: string): URL` and `parsePort(raw: string): number` — one small helper per field.
 - `loadConfig(): Config` — runs presence, conversion and validation in order and returns the config.
-- A temporary `console.log` emitting a `cli.config.resolved` line. **This is scaffolding.** Milestone
-  0.4 replaces it with the real structured logger, and after that there should be no bare
-  `console.log` anywhere in the codebase.
+- A temporary `console.log` emitting a `cli.config.resolved` line. **This is scaffolding.** It was
+  removed at Milestone 0.3 once the proxy had real logs of its own, and Milestone 0.4 replaces the
+  rest with the real structured logger. After that there should be no bare `console.log` anywhere.
 
-I also wrote **`check.ps1`** at the repository root: a PowerShell loop that runs all fifteen
-verification cases and prints each exit code. I will extend this at every later phase rather than
-rewriting it, and it doubles as a record of exactly what the CLI is supposed to accept and reject.
+I also wrote **`check.ps1`** at the repository root: a PowerShell loop that runs all the verification
+cases and prints each exit code. I will extend this at every later phase rather than rewriting it,
+and it doubles as a record of exactly what the CLI is supposed to accept and reject.
 
-**How I proved it worked.** All fifteen cases behave correctly.
+**How I proved it worked.** All nineteen cases behave correctly.
 
 Five valid inputs exit `0`, including the boundary ports 1 and 65535, and both `http:` and `https:`
-targets. Ten invalid inputs exit `2` with one clean sentence and no stack trace: no arguments at all,
+targets. The invalid inputs exit `2` with one clean sentence and no stack trace: no arguments at all,
 an unknown flag, `--port abc`, `--port 0`, `--port 65536`, `--port 40.5`, `--port ""`,
-`--target localhost:8080`, `--target ftp://localhost:8080`, and `--target "not a url"`. I also
-confirmed with `npx tsx src/index.ts --bogus > out.txt` that the error still appears on the console
-and `out.txt` stays empty, which proves errors go to stderr and not stdout.
+`--target localhost:8080`, `--target ftp://localhost:8080`, `--target "not a url"`, and the four
+bare-origin cases. I also confirmed with `npx tsx src/index.ts --bogus > out.txt` that the error
+still appears on the console and `out.txt` stays empty, which proves errors go to stderr and not
+stdout.
 
 **What I understood, including the mistakes that taught me.**
 
@@ -236,14 +257,109 @@ Two rules bind them. Each step assumes the previous one succeeded, and **no step
 belonging to another step**. And I should finish one field completely before starting the next;
 interleaving them is how I lost track of what had already been checked.
 
-**Decisions made.** `--target` accepts a path prefix — see the standing decisions section above.
+**Decisions made.** `--target` must be a bare origin — see the standing decisions section above. I
+originally decided the opposite and reversed it the same day.
+
+---
+
+## 2026-09-03 — Phase 0, Milestone 0.3: the proxy core ✅
+
+**The one idea:** a reverse proxy receives a request on one port and relays it to another. No faults,
+no recording, no assertions. If my app cannot tell the difference between talking to shipwreck and
+talking to the backend directly, the milestone succeeded.
+
+**What I built.**
+
+- Split the code into three files. `src/config.ts` holds everything from Milestone 0.2.
+  `src/proxy.ts` is new and exports one function, `startProxy(config: Config): Server`.
+  `src/index.ts` is now a four-line entry point that calls `startProxy(loadConfig())`. The split is
+  not cosmetic: in Phase 5 my integration tests need to start a proxy against a throwaway target
+  server without going anywhere near `process.argv`, and that test is three lines only if
+  `startProxy` takes a plain `Config` object.
+- The forward itself. Build the upstream URL with `new URL(req.url ?? '/', config.target)`, open an
+  outbound `http.request`, copy the method and every header across with `host` overridden to
+  `upstreamURL.host`, then `req.pipe(upstreamRequest)` outbound and `upstreamResponse.pipe(res)`
+  inbound.
+- Error handling on all four streams, and structured logs for startup, completion, and each of the
+  four ways forwarding can fail. The event table is in the README.
+
+**How I proved it worked.** I wrote a throwaway echo backend that reports the method, path, `Host`
+header and body byte count it received, plus two deliberately hostile endpoints: one that sends
+headers and then destroys its socket partway through the body, and one that waits four seconds
+before answering. Four cases, all passing:
+
+| Case | Client sees | Proxy logs |
+|---|---|---|
+| `GET` and `POST` with a body | 200, body intact, backend saw `host: localhost:8081` | `proxy.request.forwarded` with a sane `durationMs` |
+| Backend down entirely | 502, and the proxy stays up | `proxy.forward.failed ECONNREFUSED` |
+| Backend dies mid-response | truncated body in 0.15s, no hang | `proxy.response.failed ECONNRESET` |
+| Client aborts after 1 second | — | `proxy.forward.cancelled ECONNRESET`, and the backend observed its own socket close early |
+
+`npx tsc --noEmit` is clean.
+
+**What I understood, including the mistakes that taught me.**
+
+- **An error handler must never terminate the process.** My editor auto-imported `fail` from
+  `node:assert` when I wanted to log a forward failure. `assert.fail()` does not log — it *throws* an
+  `AssertionError`. The throw happened inside an `error` event handler where nothing catches it, so
+  the entire proxy died the first time the backend refused a connection. The deeper point is that my
+  own `fail()` in `config.ts` would have been just as wrong, because it calls `process.exit(2)`.
+  **In a fail-soft component an error handler may log, may respond, and may close a connection, but
+  may never call anything that terminates the process.** Exiting belongs to the CLI startup layer,
+  where there is nothing yet to degrade to. Two functions named `fail` with opposite obligations is
+  itself the smell.
+- **Every stream is its own failure domain.** I had handlers on two streams and asked whether the
+  response direction needed them too. It did. Measured behaviour when the backend dies mid-response:
+  `upstreamResponse` emits `aborted`, then `error` (`ECONNRESET`), then `close`, while
+  `upstreamRequest` emits only `close` and never `error`. So my existing handler could not possibly
+  see it. Worse, an `IncomingMessage` with no `'error'` listener does not throw — it goes silent, so
+  the client hung for its full timeout with nothing in my log. A silent hang is worse than a crash.
+  **A proxied exchange has four independent streams** — client to proxy request, proxy to backend
+  request, backend to proxy response, proxy to client response. Each fails independently, each has
+  its own `error` event, and `pipe()` carries data but not failures. If I can name four streams, I
+  need four error handlers.
+- **A log event must distinguish what happened from what I did.** I used the name
+  `proxy.response.failed` for two different failures, one on the client side and one on the backend
+  side. Worse, when my own `res.on('close')` handler cancelled the outbound request, the resulting
+  `ECONNRESET` was logged as `proxy.forward.failed` — shipwreck reporting its own deliberate action
+  as a backend fault. That matters far beyond tidiness: these records are what the Phase 3 assertion
+  engine reads, so an impatient client would have manufactured a phantom fault and shipwreck would
+  have graded my app on a failure it invented itself. Fixed with a `clientGone` flag and a distinct
+  `proxy.forward.cancelled` event. **An event name is an interface, not a comment.**
+- **Rewrite the `Host` header.** The browser sends shipwreck's own host and port. Forwarding that
+  unchanged breaks any backend that does virtual-host routing, generates absolute URLs such as
+  redirect `Location` headers or pagination links, or validates the origin — which Spring Security
+  may well do. `URL.host` includes the port, which is what the header wants; `URL.hostname` does not.
+- **Pipe, do not buffer.** `pipe()` handles backpressure — the mechanism by which a slow reader tells
+  a fast writer to pause. A hand-rolled `on('data')` loop that ignores the return value of `write()`
+  does not, and it will buffer an entire large response in memory when the client is slower than the
+  backend. Buffering an arbitrary upload with no cap is a memory-exhaustion foot-gun. I will buffer
+  deliberately in Phase 2 to hash bodies, but with an explicit configurable cap, which is a different
+  decision made for a different reason.
+- **Smaller corrections.** A conditional whose two branches were identical
+  (`if (!res.headersSent) { res.destroy() } else { res.destroy() }`) — deleted, because `writeHead`
+  runs synchronously two lines below where that listener is registered, so `headersSent` is always
+  true by the time it can fire. `upstreamRequest` referenced inside listeners declared above its own
+  `const` — worked only because events are asynchronous, so I moved the declaration up. And
+  `error.code` needs the `NodeJS.ErrnoException` annotation, because Node types the `'error'` payload
+  as plain `Error` while system errors are a subclass carrying `code`, `errno` and `syscall`.
+
+**Known and deliberately deferred.**
+
+- An aborted request produces no `proxy.request.forwarded` line, because `'finish'` only fires on a
+  clean end. Acceptable now. At Phase 2 every request needs a record that eventually gets marked
+  complete, and `'close'` is the event that always fires, so that is where the backstop goes.
+- `clientGone` is set inside a condition meaning "the response did not finish cleanly", which is
+  broader than "the client left". The two coincide today under measured event ordering, but the code
+  does not guarantee it. If I ever see a `proxy.forward.cancelled` I cannot explain, that gap is the
+  first place to look.
+- `check.ps1` still only covers exit codes. The four proxy cases need two servers running at once, so
+  they do not script cleanly yet. They become automatable at Phase 5, when the Vitest suite starts
+  its own throwaway backend in-process — the same echo server I tested against by hand.
 
 ---
 
 ## Open questions
 
-- **2026-09-03 —** Now that a target can carry a path prefix, which path should the Recorder store in
-  Phase 2: the client-visible path (`/orders`) or the upstream path (`/api/orders`)? Fingerprinting
-  is internally consistent either way, since every request in a run goes through the same target. I
-  am leaning toward the client-visible path, because it is what my application actually sent and it
-  is what I would recognise when reading a report. Decide at Milestone 2.1 when I build the Recorder.
+*None outstanding.* The Phase 2 question about which path the Recorder should store was dissolved by
+the bare-origin decision on 3 September 2026: with no prefix there is only one path.
