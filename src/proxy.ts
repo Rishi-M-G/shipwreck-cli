@@ -1,5 +1,6 @@
 import { createServer, request, Server } from "node:http";
 import { Config } from "./config.js";
+import { log } from "./log.js";
 
 export function startProxy(config: Config): Server {
     const server = createServer((req, res) => {
@@ -21,10 +22,10 @@ export function startProxy(config: Config): Server {
             (upstreamResponse) => {
                 // Backend -> Proxy failure handling
                 upstreamResponse.on('error', (error: NodeJS.ErrnoException) => {
-                    console.error(`proxy.response.failed`, {
+                    log.error(`proxy.response.failed`, {
                         method: req.method,
                         path: req.url,
-                        error: error.code
+                        error: error.code ?? 'UNKNOWN'
                     });
                     res.destroy();
                 })
@@ -36,7 +37,7 @@ export function startProxy(config: Config): Server {
         res.on('finish', () => {
             const durationMs = Date.now() - startTime;
 
-            console.log("proxy.request.forwarded", {
+            log.info("proxy.request.forwarded", {
                 method: req.method,
                 path: req.url,
                 status: res.statusCode,
@@ -45,10 +46,10 @@ export function startProxy(config: Config): Server {
         });
 
         res.on('error', (error: NodeJS.ErrnoException) => {
-            console.error("proxy.client.write_failed", {
+            log.error("proxy.client.write_failed", {
                 method: req.method,
                 path: req.url,
-                error: error.code
+                error: error.code ?? 'UNKNOWN'
             });
 
             upstreamRequest.destroy();
@@ -66,16 +67,16 @@ export function startProxy(config: Config): Server {
         // Proxy -> Backend Failure Handling
         upstreamRequest.on('error', (error: NodeJS.ErrnoException) => {
             if (clientGone) {
-                console.error(`proxy.forward.cancelled`, {
+                log.error(`proxy.forward.cancelled`, {
                     method: req.method,
                     path: req.url,
-                    error: error.code
+                    error: error.code ?? 'UNKNOWN'
                 });
             } else {
-                console.error(`proxy.forward.failed`, {
+                log.error(`proxy.forward.failed`, {
                     method: req.method,
                     path: req.url,
-                    error: error.code
+                    error: error.code ?? 'UNKNOWN'
                 });
                 if (!res.headersSent) {
                     res.writeHead(502);
@@ -89,10 +90,10 @@ export function startProxy(config: Config): Server {
 
         // Client -> Proxy Failure Handling
         req.on('error', (error: NodeJS.ErrnoException) => {
-            console.error(`proxy.request.failed`, {
+            log.error(`proxy.request.failed`, {
                 method: req.method,
                 path: req.url,
-                error: error.code
+                error: error.code ?? 'UNKNOWN'
             });
             upstreamRequest.destroy();
         });
@@ -101,13 +102,11 @@ export function startProxy(config: Config): Server {
         req.pipe(upstreamRequest); // Whatever body comes into req pipe it to upstream request
     });
     server.listen(config.port, () => {
-        console.log("proxy.listening", {
+        log.info("proxy.listening", {
             port: config.port,
             target: config.target.href
         });
     });
-
-
 
     return server;
 }
