@@ -7,9 +7,10 @@ faults, and then **grades how the application responded**. It produces a pass/fa
 report and a non-zero exit code on failure, so it can gate a CI pipeline.
 
 > **Status: in active development. Phase 0 of 6.**
-> This is not installable yet. The command-line interface parses and validates its arguments, and
-> the forwarding proxy works end to end — traffic passes through it unchanged and every failure
-> path is logged. Fault injection, recording and the assertion engine are not built.
+> This is not installable yet. The command-line interface parses and validates its arguments, the
+> forwarding proxy works end to end — traffic passes through it unchanged and every failure path is
+> logged — and all logging goes through a single module that writes one line of JSON per event to
+> stderr. Fault injection, recording and the assertion engine are not built.
 > See [docs/PROGRESS.md](./docs/PROGRESS.md) for the dated build log.
 
 ---
@@ -92,11 +93,33 @@ and reports every way that forwarding can fail.
   doing work nobody will read.
 - **Nothing in the request path can terminate the process.** An error handler may log, respond, and
   close a connection. Exiting belongs to startup, where there is nothing yet to degrade to.
+- **Every log line is machine-readable.** All output goes through one module, `src/log.ts`, which
+  writes each event as a single line of JSON. The format is defined in one place rather than at
+  each call site, and it is already in the shape the assertion engine will consume.
+
+### The shape of a log record
+
+Every line shipwreck writes is one JSON object on stderr:
+
+```
+{"method":"GET","path":"/hello","status":200,"durationMs":6,"ts":"2026-09-04T13:43:20.068Z","level":"info","event":"proxy.request.forwarded"}
+```
+
+Three fields are always present. `ts` is an ISO 8601 timestamp, `level` is `info` or `error`, and
+`event` names what happened. Every remaining key is a named field belonging to that event. Those
+three identity fields are written *after* the caller's fields, so a caller field whose name collides
+with one of them cannot overwrite it — the assertion engine has to be able to trust `event`.
+
+If a caller's fields cannot be serialised, which `JSON.stringify` refuses to do for a circular
+structure or a `BigInt`, the record is still written. The fields are replaced by
+`logFieldsDropped: true` and a `reason`, and the process keeps running. The logger is called from
+inside every error handler in the proxy, so a logging call that threw would destroy the evidence of
+the original problem and add a second problem on top of it.
 
 ### Log events emitted so far
 
-Every log line is an event name followed by named fields, never a concatenated string. These records
-are the input the assertion engine will read in Phase 3, so each event name means exactly one thing.
+Each event name means exactly one thing, because these records are the input the assertion engine
+will read in Phase 3.
 
 | Event | Meaning | Fields |
 |---|---|---|
@@ -135,6 +158,13 @@ and point that base URL at shipwreck: `http://localhost:4000/api`.
 Anything that fails validation produces a single-sentence message on **stderr** and exit code `2`.
 No failure path prints a stack trace. The full set of cases the CLI is checked against lives in
 `check.ps1` at the repository root.
+
+### Output streams
+
+All diagnostic output goes to **stderr**: startup, per-request logs, failures, and usage messages.
+**stdout is deliberately left empty** and is reserved for the resilience report that Phase 4 will
+produce, so that `shipwreck run scenario.ts --json > report.json` yields a file containing the
+report and nothing else.
 
 ## Honest limits
 
@@ -186,6 +216,9 @@ The payoff is that `shipwreck run scenario.ts && deploy` only deploys when resil
   fields, such as `log.info('proxy.request.forwarded', { method, path, status, durationMs })`, never
   concatenated strings. This is a tool about observability discipline, so its own logs should be the
   reference example.
+- **One logging module rather than scattered `console` calls.** `src/log.ts` owns the record format,
+  so changing it later means editing one function. It is also the only component that runs on every
+  failure path in the proxy, which makes it the one function that must not be able to throw.
 
 ## Build plan
 
@@ -193,7 +226,7 @@ Each phase has a gate. The next phase does not begin until the current gate pass
 
 | Phase | Deliverable | Gate | Status |
 |---|---|---|---|
-| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | 🔧 in progress (0.1–0.3 done) |
+| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | 🔧 in progress (0.1–0.4 done) |
 | 1 | Fault injection (latency, failure) | The flags visibly change application behaviour | ⬜ |
 | 2 | Request recording and fingerprinting | A duplicate POST is detected, and a non-duplicate is *not* flagged | ⬜ |
 | 3 | Scenario and assertion engine | One expectation gives a real pass on good traffic and a real fail on bad traffic | ⬜ |

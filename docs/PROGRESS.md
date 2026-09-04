@@ -17,13 +17,12 @@ get buried. Open questions live at the bottom of the file.
 - **Milestone 0.1 — Package setup: complete and verified** (1 September 2026).
 - **Milestone 0.2 — CLI arguments and validation: complete and verified** (3 September 2026).
 - **Milestone 0.3 — The proxy core: complete and verified** (3 September 2026).
-- **Next: Milestone 0.4 — the real logger.** Replace the `console.log` and `console.error` calls in
-  `src/proxy.ts` with a small logging module that emits the same event-name-plus-fields shape, so
-  the format is defined in one place instead of repeated at every call site.
-- Phase 0's gate has not been reached yet. The gate is: my application runs normally through the
-  proxy, every request produces one structured log line, and nothing is broken. That is Milestone
-  0.5, after the logger.
-
+- **Milestone 0.4 — The real logger: complete and verified** (4 September 2026). Every log line now
+  goes through `src/log.ts` and is written as one line of JSON on stderr. No `console.` call remains
+  anywhere in `src/`.
+- **Next: Milestone 0.5 — the Phase 0 gate.** Point my React application's API base URL at the
+  proxy, use the application normally, and confirm that nothing is broken and that every request
+  produces exactly one structured log line. That is the last milestone in Phase 0.
 ---
 
 ## Standing decisions
@@ -93,6 +92,26 @@ fail-soft rule. I kept the name and removed the risk differently, by deleting th
 
 This file is in `docs/`, not at the repository root. That is a choice, not drift. There is exactly
 one progress file in the repository.
+
+### 2026-09-04 — Diagnostics go to stderr, and stdout is reserved for the report
+
+Every line shipwreck writes for a human or a log collector goes to **stderr**. Nothing is written to
+stdout at all, and stdout is reserved for the resilience report that Phase 4 will produce.
+
+A process has two output channels rather than one. `console.log` writes to stdout and
+`console.error` writes to stderr, and a terminal displays both on the same screen, which is exactly
+why the difference is invisible until something other than a terminal reads the output. Shell
+redirection with `>` captures stdout only.
+
+The reason this matters is concrete. At Phase 4 someone will run
+`shipwreck run scenario.ts --json > report.json` inside a CI job. If my per-request diagnostic lines
+were also on stdout they would land inside `report.json` and the file would no longer parse.
+Deciding this now costs one line. Discovering it at Phase 4 costs a refactor, and a confusing bug
+first.
+
+The honest cost: someone who redirects stdout expecting to capture the logs gets an empty file,
+because the logs are on the other channel. That is the conventional behaviour for command-line
+tools, so it is a surprise people already expect.
 
 ---
 
@@ -356,6 +375,93 @@ before answering. Four cases, all passing:
 - `check.ps1` still only covers exit codes. The four proxy cases need two servers running at once, so
   they do not script cleanly yet. They become automatable at Phase 5, when the Vitest suite starts
   its own throwaway backend in-process — the same echo server I tested against by hand.
+
+---
+
+## 2026-09-04 — Phase 0, Milestone 0.4: the real logger ✅
+
+**What I built.** `src/log.ts`, a module that owns the log format so that the format is defined in
+exactly one place instead of being repeated at every call site. It exports a `log` object with
+`info` and `error`, and both delegate to a private `emit`. Every record is one line of JSON written
+to **stderr**, carrying `ts` as an ISO 8601 timestamp, `level`, `event`, and whatever named fields
+the caller passed. I then replaced all seven `console.log` and `console.error` calls in
+`src/proxy.ts`, changing no event name and no field, so this milestone was purely a change of
+transport.
+
+`emit` is deliberately not exported. The record format is an implementation detail of this module,
+and keeping `log.info` and `log.error` as the only entry points means that when Phase 4 changes the
+format there is exactly one function to edit.
+
+**How I proved it worked.** I ran the proxy against my throwaway echo backend, and separately made
+deliberately hostile calls into the logger itself.
+
+| Case | Result |
+|---|---|
+| `tsc --noEmit` | clean |
+| `GET`, `POST` with a body, client abort, backend killed | behaviour identical to Milestone 0.3 |
+| Every line the proxy emitted, fed to `JSON.parse` | 6 of 6 parsed |
+| Proxy started with stdout redirected to a file | the file is 0 bytes, and the logs still appeared on screen |
+| A deliberately circular object passed as a field | fallback line written, process survived, the next request logged normally |
+| `log.info('proxy.stopped')` called with no fields | compiles |
+| Bad `--target`, bad `--port` | still exit 2 |
+
+**What I understood, including the mistakes that taught me.**
+
+- **stdout carries results and stderr carries diagnostics.** I had never had to think about the
+  difference, because a terminal shows both on the same screen. The difference only appears when
+  something else reads the output, and `>` captures stdout only. The reasoning and the cost are in
+  the standing decisions section above.
+- **The recovery path is the code that never runs, which is precisely why it is where the bugs
+  are.** My first attempt at the `catch` block contained three bugs in seven lines while the happy
+  path was flawless. I wrote `new Date().toISOString` without the parentheses, so `ts` held the
+  function rather than the string, and `JSON.stringify` silently drops keys whose value is a
+  function — the fallback line had no timestamp at all. I wrote `reason: err`, and `JSON.stringify`
+  turns an `Error` into `{}`, so the line reported that serialisation had failed but never said why.
+  And I forgot the `"\n"`, so the fallback ran into the following record and neither line parsed.
+  `tsc` was clean on all three, because the object literal had no declared type and TypeScript
+  inferred `ts: () => string` quite happily. **A recovery path I have never executed is not a
+  recovery path, it is an untested assumption.** Running the circular-object case once — the single
+  case the whole block exists for — put all three failures on my screen in about ten seconds.
+- **`JSON.stringify` fails in more ways than I expected.** It throws on a circular structure and on
+  a `BigInt`, and it silently drops keys whose value is `undefined` or a function. The throw is the
+  one that matters, because `log.error` is called from inside five error handlers, which means the
+  logger is now on every failure path in the proxy. The 0.3 rule about error handlers never
+  terminating the process therefore applies to the logger itself. I proved the cost by adding
+  `socket: req.socket` as one extra context field, exactly the sort of thing I will want at Phase 2:
+  the client received no response at all, the failure was never logged, and the proxy process
+  exited. A logging call that throws destroys the evidence of the original problem and adds a second
+  problem on top of it. The dropped-`undefined` case was live in my own code too, because
+  `NodeJS.ErrnoException.code` is optional, so a non-system error would have produced a failure line
+  with no `error` key. Fixed at the five call sites with `error: error.code ?? 'UNKNOWN'`, which
+  keeps the logger simple and makes the gap visible rather than invisible.
+- **Spread order decides who wins a name collision.** With `{ ts, level, event, ...fields }`, a
+  caller passing a field named `event` silently replaced the real event name, and I watched
+  `"event":"something.else"` come out. The three identity fields now come *after* the spread, so the
+  framework always wins. These records are what the Phase 3 assertion engine reads, so `event` has
+  to be trustworthy.
+- **`process.stderr.write` does not actually throw, so only the formatting needs guarding.** I
+  assumed a failing write was a real risk and was about to structure the code around it. Measured
+  against three genuine failure modes — stderr closed with `2>&-`, stderr redirected to `/dev/full`
+  to simulate a full disk, and stderr on a pipe whose reader had already exited — `write()` returned
+  normally every time. Node routes those errors to the stream's `error` event and handles them
+  quietly for stdout and stderr specifically, rather than throwing at the call site. So keeping the
+  `JSON.stringify` and the write inside a single `try` is safe here. Worth remembering as a method
+  rather than only as a fact: I nearly added an entire extra layer of defence for a failure that
+  measurement showed cannot happen.
+
+**Known and deliberately deferred.**
+
+- The fallback line loses the caller's fields entirely. That is the honest trade, because the fields
+  are the thing that failed to serialise, so a recovery path that tried to include them would fail
+  in the same way. It keeps the event name, the level and the timestamp, and adds
+  `logFieldsDropped: true` so the record is unambiguous when Phase 3 reads it.
+- `level` is typed as `string` rather than as a union of `"info" | "error"`. The two public
+  functions are the only callers and both pass literals, so nothing can go wrong today. Worth
+  narrowing when Phase 4 adds a level, because at that point the set of valid levels becomes part of
+  the record schema rather than an internal detail.
+- The record itself has no declared TypeScript type. That is exactly what let the `toISOString` typo
+  through. A `LogRecord` interface would have caught it at compile time instead of at runtime, and
+  is worth adding once the shape stops changing.
 
 ---
 
