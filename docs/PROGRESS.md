@@ -13,16 +13,17 @@ get buried. Open questions live at the bottom of the file.
 
 ## Where I am right now
 
-- **Phase 0 — Scaffold and forwarding proxy**, in progress.
-- **Milestone 0.1 — Package setup: complete and verified** (1 September 2026).
-- **Milestone 0.2 — CLI arguments and validation: complete and verified** (3 September 2026).
-- **Milestone 0.3 — The proxy core: complete and verified** (3 September 2026).
-- **Milestone 0.4 — The real logger: complete and verified** (4 September 2026). Every log line now
-  goes through `src/log.ts` and is written as one line of JSON on stderr. No `console.` call remains
-  anywhere in `src/`.
-- **Next: Milestone 0.5 — the Phase 0 gate.** Point my React application's API base URL at the
-  proxy, use the application normally, and confirm that nothing is broken and that every request
-  produces exactly one structured log line. That is the last milestone in Phase 0.
+- **Phase 0 — Scaffold and forwarding proxy: COMPLETE.** Gate passed 9 September 2026.
+- Milestone 0.1 — Package setup: complete and verified (1 September 2026).
+- Milestone 0.2 — CLI arguments and validation: complete and verified (3 September 2026).
+- Milestone 0.3 — The proxy core: complete and verified (3 September 2026).
+- Milestone 0.4 — The real logger: complete and verified (4 September 2026).
+- Milestone 0.5 — The Phase 0 gate: passed (9 September 2026). My real React admin panel ran through
+  the proxy against Spring Boot on port 8082 and behaved identically, including logging out and
+  logging back in. Twenty-four requests forwarded, zero failure events.
+- **Next: Phase 1 — fault injection.** Add `--latency`, `--fail-rate` and `--fail-status`, and keep
+  the decision about whether to perturb a request separate from the proxy that applies it, so the
+  decision stays a pure function I can unit-test later.
 ---
 
 ## Standing decisions
@@ -112,6 +113,22 @@ first.
 The honest cost: someone who redirects stdout expecting to capture the logs gets an empty file,
 because the logs are on the other channel. That is the conventional behaviour for command-line
 tools, so it is a surprise people already expect.
+
+### 2026-09-09 — Phase 3 assertions must use tolerance bands, never absolute timings
+
+This is a constraint I measured rather than a preference. It is recorded here rather than left in
+the milestone entry, because it decides something in Phase 3.
+
+At the Phase 0 gate I watched the same request — `GET /api/v1/admin/agencies`, nothing changed, same
+machine, no other load — take **838 ms** and then **121 ms**, 147 milliseconds apart. That is roughly
+a sevenfold spread on identical work. The first call pays for connection setup, JIT warm-up and
+whatever Spring initialises lazily. The second pays for none of it.
+
+The consequence for Phase 3: an expectation such as `backsOff` has to assert that the *gaps between
+retries grow*, which is a relative claim about a sequence rather than a claim about any single
+number. Any absolute threshold needs a tolerance band wide enough to survive that spread. An
+assertion written as "the retry must arrive more than 500 ms after the failure" would have passed or
+failed here depending on nothing but whether the JVM happened to be warm.
 
 ---
 
@@ -462,6 +479,80 @@ deliberately hostile calls into the logger itself.
 - The record itself has no declared TypeScript type. That is exactly what let the `toISOString` typo
   through. A `LogRecord` interface would have caught it at compile time instead of at runtime, and
   is worth adding once the shape stops changing.
+
+---
+
+## 2026-09-09 — Phase 0, Milestone 0.5: the gate — PHASE 0 COMPLETE ✅
+
+**What I built.** Nothing. This milestone is the gate itself. Its only job is to find out whether the
+proxy is genuinely transparent to a real browser rather than to `curl`, which is a far better-behaved
+client than anything real.
+
+**What I did.** Started Spring Boot on port 8082, started shipwreck with
+`npm run dev -- --target http://localhost:8082 --port 4000`, repointed the React admin panel's API
+base URL at port 4000, and used the application normally — loaded the dashboard, paged through
+customers, opened analytics, listed orders, logged out, and logged back in.
+
+**How I proved it worked.** Twenty-four requests passed through the proxy. The application behaved
+identically to running against the backend directly, and shipwreck logged every one of them with no
+failure events at all: no `proxy.forward.failed`, no `proxy.response.failed`, and no
+`proxy.forward.cancelled`.
+
+| What a browser does that `curl` never did | Evidence in the log |
+|---|---|
+| CORS preflight | Every `OPTIONS` returned 200 and the real request followed it |
+| Query strings | `?page=0&size=20` and `?from=…&to=…&bucket=day` reached the backend intact |
+| Request bodies from a real client | `POST /api/v1/panel/login` and `POST /api/v1/panel/logout`, both 200 |
+| Authentication across a session boundary | Logged out, logged back in, dashboard reloaded correctly |
+| Several requests issued at once | Four requests started within 50 ms of each other, all forwarded cleanly |
+
+**What I understood.**
+
+- **The browser's preflight cache is visible in my own log, and so is a miss.** A cross-origin
+  request that is not "simple" makes the browser send an `OPTIONS` request first, asking the server
+  whether the real request is allowed. The browser then caches that answer for as long as the
+  server's `Access-Control-Max-Age` header permits. At 09:46 I watched the cache work: the first
+  `GET /api/v1/admin/agencies` was preceded by an `OPTIONS`, and the repeat 147 ms later was not,
+  because the cached answer was still valid.
+
+  At 09:58, after logging back in, the same path produced **two** preflights instead of none.
+  Subtracting `durationMs` from each `ts` shows why: both `OPTIONS` requests *started* at almost
+  exactly the same instant, 09:58:48.337. Neither could benefit from the other, because the cache
+  entry only exists once the first answer has come back. Two concurrent callers both missed a cache
+  that either one of them was about to fill.
+
+  That pattern has a name — a **thundering herd**, or a cache stampede. It is the same shape as the
+  backend problem where a popular cache key expires and every in-flight request goes to the database
+  at once. Two things are worth taking from it. First, it doubled the request count for that path,
+  which is exactly the sort of thing shipwreck exists to make visible. Second, concurrency changes
+  what the network does: identical application code produced no preflight at 09:46 and two at 09:58,
+  purely because the calls happened to overlap the second time.
+
+- **My application issues the same GET twice, consistently.** `GET /api/v1/admin/agencies` appears
+  twice in both sessions. It is harmless, because a GET changes nothing — and that harmlessness is
+  the point. It is real duplicate-shaped traffic produced by my own code, and it is precisely the
+  safe case that Phase 2's detector must *not* flag. Worth keeping as a fixture rather than fixing:
+  it is free evidence for the false-positive half of the Phase 2 gate.
+
+- **Timing on an idle machine varies by roughly seven times.** Recorded as a standing decision above,
+  because it constrains how Phase 3 assertions have to be written.
+
+- **`ts` records when a request completed, not when it started.** The value is written inside
+  `res.on('finish')`. For a per-request log line that is fine. For reasoning about the gaps between
+  requests it is not, because ordering by completion time is not the same as ordering by start time —
+  I had to subtract `durationMs` from `ts` by hand to establish that the two preflights above were
+  simultaneous. Phase 2's recorder captures a request timestamp separately, so this resolves itself
+  there rather than needing a fix now.
+
+**Known and deliberately deferred.**
+
+- **Websocket connections are not proxied.** `http.createServer` emits an `upgrade` event for a
+  connection that asks to switch protocols, and shipwreck does not listen for it, so Node closes the
+  socket. My admin panel does not use websockets, so this did not come up. It belongs in the README
+  as an honest limit rather than as work, because Phase 3 is the moat and this is not.
+- The two items already carried forward from 0.3 and 0.4 still stand: an aborted request produces no
+  `proxy.request.forwarded` line because `'finish'` only fires on a clean end, and `clientGone` is
+  set on a condition slightly broader than "the client left".
 
 ---
 

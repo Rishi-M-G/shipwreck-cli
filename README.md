@@ -6,11 +6,13 @@ A command-line tool that sits between a frontend and its backend, injects contro
 faults, and then **grades how the application responded**. It produces a pass/fail resilience
 report and a non-zero exit code on failure, so it can gate a CI pipeline.
 
-> **Status: in active development. Phase 0 of 6.**
-> This is not installable yet. The command-line interface parses and validates its arguments, the
-> forwarding proxy works end to end — traffic passes through it unchanged and every failure path is
-> logged — and all logging goes through a single module that writes one line of JSON per event to
-> stderr. Fault injection, recording and the assertion engine are not built.
+> **Status: in active development. Phase 0 of 6 is complete.**
+> This is not installable yet. What works: the command-line interface parses and validates its
+> arguments, the forwarding proxy relays traffic unchanged and reports every way forwarding can
+> fail, and all logging goes through a single module that writes one line of JSON per event to
+> stderr. Phase 0 was verified against a real React application talking to a real Spring Boot
+> backend, not only against `curl`. Fault injection, recording and the assertion engine are not
+> built yet.
 > See [docs/PROGRESS.md](./docs/PROGRESS.md) for the dated build log.
 
 ---
@@ -97,6 +99,21 @@ and reports every way that forwarding can fail.
   writes each event as a single line of JSON. The format is defined in one place rather than at
   each call site, and it is already in the shape the assertion engine will consume.
 
+### Verified against a real application, not just `curl`
+
+`curl` is an unusually well-behaved client: one connection, one request, one response. A browser is
+not. Phase 0 closed by running a React admin panel against a Spring Boot backend through the proxy
+and confirming the application behaved identically. Twenty-four requests were forwarded with zero
+failure events, and the run exercised the things `curl` never touches:
+
+| Browser behaviour | Confirmed |
+|---|---|
+| CORS preflight — an `OPTIONS` request the browser sends before certain cross-origin calls, and which it refuses to proceed without | every preflight returned 200 and the real request followed |
+| Query strings preserved through the proxy | `?page=0&size=20`, `?from=…&to=…&bucket=day` |
+| Request bodies sent by a real client | `POST` login and logout, both 200 |
+| Authentication across a session boundary | logged out, logged back in, dashboard reloaded |
+| Several requests issued at the same moment | four starting within 50 ms, all forwarded cleanly |
+
 ### The shape of a log record
 
 Every line shipwreck writes is one JSON object on stderr:
@@ -181,6 +198,9 @@ reviewer stops believing.
    Assertions on UI state would require a browser driver and are explicitly out of scope.
 3. **Shipwreck tests an application you own, running locally.** It is not a penetration-testing
    tool and must never be pointed at a third-party host.
+4. **Websocket connections are not proxied.** A client asking to upgrade the protocol has its
+   connection closed rather than relayed. Shipwreck proxies HTTP request and response traffic, which
+   is where the failure modes it grades actually live.
 
 ## The exit-code contract
 
@@ -226,8 +246,8 @@ Each phase has a gate. The next phase does not begin until the current gate pass
 
 | Phase | Deliverable | Gate | Status |
 |---|---|---|---|
-| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | 🔧 in progress (0.1–0.4 done) |
-| 1 | Fault injection (latency, failure) | The flags visibly change application behaviour | ⬜ |
+| 0 | Scaffold and forwarding proxy | The app runs normally through the proxy and every request is logged | ✅ complete |
+| 1 | Fault injection (latency, failure) | The flags visibly change application behaviour | 🔧 next |
 | 2 | Request recording and fingerprinting | A duplicate POST is detected, and a non-duplicate is *not* flagged | ⬜ |
 | 3 | Scenario and assertion engine | One expectation gives a real pass on good traffic and a real fail on bad traffic | ⬜ |
 | 4 | Resilience report | Terminal scorecard, JSON output, correct exit codes | ⬜ |
