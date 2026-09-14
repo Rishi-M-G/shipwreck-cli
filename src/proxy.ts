@@ -104,7 +104,10 @@ export function startProxy(config: Config): Server {
     server.listen(config.port, () => {
         log.info("proxy.listening", {
             port: config.port,
-            target: config.target.href
+            target: config.target.href,
+            latencyMs: config.faults.latencyMs,
+            failRate: config.faults.failRate,
+            failStatus: config.faults.failStatus
         });
     });
 
