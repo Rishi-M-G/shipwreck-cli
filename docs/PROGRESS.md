@@ -13,17 +13,16 @@ get buried. Open questions live at the bottom of the file.
 
 ## Where I am right now
 
-- **Phase 0 — Scaffold and forwarding proxy: COMPLETE.** Gate passed 9 September 2026.
-- Milestone 0.1 — Package setup: complete and verified (1 September 2026).
-- Milestone 0.2 — CLI arguments and validation: complete and verified (3 September 2026).
-- Milestone 0.3 — The proxy core: complete and verified (3 September 2026).
-- Milestone 0.4 — The real logger: complete and verified (4 September 2026).
-- Milestone 0.5 — The Phase 0 gate: passed (9 September 2026). My real React admin panel ran through
-  the proxy against Spring Boot on port 8082 and behaved identically, including logging out and
-  logging back in. Twenty-four requests forwarded, zero failure events.
-- **Next: Phase 1 — fault injection.** Add `--latency`, `--fail-rate` and `--fail-status`, and keep
-  the decision about whether to perturb a request separate from the proxy that applies it, so the
-  decision stays a pure function I can unit-test later.
+- **Phase 0 — Scaffold and forwarding proxy: COMPLETE.** Gate passed 9 September 2026. Milestones
+  0.1 through 0.5 are complete and verified, each with its own entry below. The gate ran my real
+  React admin panel through the proxy against Spring Boot on port 8082 and the application behaved
+  identically. Twenty-four requests forwarded, zero failure events.
+- **Phase 1 — Fault injection: in progress.**
+- Milestone 1.1 — The fault flags: complete and verified (14 September 2026).
+- Milestone 1.2 — The fault decision function: complete and verified (14 September 2026).
+- **Next: Milestone 1.3 — apply the plan in the proxy.** Delay before forwarding, short-circuit an
+  injected failure so the backend never sees the request, and log each injected fault. The logs have
+  to keep "I forwarded this" and "I faulted this" distinct, because Phase 2 reads them as data.
 ---
 
 ## Standing decisions
@@ -553,6 +552,122 @@ failure events at all: no `proxy.forward.failed`, no `proxy.response.failed`, an
 - The two items already carried forward from 0.3 and 0.4 still stand: an aborted request produces no
   `proxy.request.forwarded` line because `'finish'` only fires on a clean end, and `clientGone` is
   set on a condition slightly broader than "the client left".
+
+---
+
+## 2026-09-14 — Phase 1, Milestone 1.1: the fault flags ✅
+
+**The one idea:** before a fault can be injected it has to be describable. This milestone adds the
+three flags that describe one, and nothing else. No fault is applied anywhere yet.
+
+**What I built**, all in `src/config.ts` apart from one line:
+
+- `interface FaultConfig { latencyMs, failRate, failStatus }`, nested inside `Config` as `faults`.
+  Nested rather than flattened so that the decision function in Milestone 1.2 can take a
+  `FaultConfig` and never be handed the target URL or the listen port, which are none of its
+  business.
+- Three options on `parseArgs`: `--latency` (default `'0'`), `--fail-rate` (default `'0'`) and
+  `--fail-status` (default `'500'`). The last two contain hyphens, so they are quoted in the options
+  object and read back as `values['fail-rate']` rather than with dot notation.
+- `parseLatency`, `parseFailRate` and `parseFailStatus` — one helper per field, the same five-step
+  shape as `parsePort`.
+- `proxy.listening` now reports `latencyMs`, `failRate` and `failStatus` alongside `port` and
+  `target`. A startup line that states the active configuration is how a log tells me afterwards
+  which mode the process was actually running in, rather than my having to remember what I typed.
+
+**Where the bounds come from.** Latency is an integer from 0 to 300000. The upper bound exists
+because `setTimeout` stops waiting and fires immediately above roughly 2.1 billion milliseconds, so
+without a bound a typo would produce a silently useless run rather than an error. Fail status is an
+integer from 400 to 599, because shipwreck injects *failures* — a 200 is not one — and because
+`res.writeHead` throws outright on a status code outside 100–599. A throw inside the request handler
+is exactly the crash the fail-soft rule forbids, so the bad value is refused at startup instead,
+where exiting is allowed.
+
+**How I proved it worked.**
+
+| Arguments after `--target http://localhost:8082` | Exit | Result |
+|---|---|---|
+| *(none)* | 0 | `latencyMs` 0, `failRate` 0, `failStatus` 500 |
+| `--latency 2000 --fail-rate 0.25 --fail-status 503` | 0 | all three carried through correctly |
+| `--fail-rate 0.5` | 0 | `failRate` 0.5 |
+| `--latency abc`, `--latency=-1`, `--latency 1.5`, `--latency 400000` | 2 | rejected |
+| `--fail-rate abc`, `--fail-rate 1.5`, `--fail-rate=-0.1` | 2 | rejected |
+| `--fail-status 200`, `--fail-status abc`, `--fail-status 600` | 2 | rejected |
+| `--port ""`, `--latency ""`, `--fail-rate ""`, `--fail-status ""` | 2 | rejected, each naming its own flag |
+
+**Two bugs, both in the same place.**
+
+The first is that `parseFailRate` used `Number.isInteger`. A fail rate is a probability, and between
+0 and 1 the only whole numbers are 0 and 1, so `--fail-rate 0.3` was rejected and the flag could not
+express fifty percent at all. `Number.isInteger` is not a stricter version of the check I wanted; it
+is a different check that happened to fit in the same slot. The right question for this field is "is
+it a number at all", which is `Number.isFinite`. I got this by copying the shape of `parsePort`,
+where "must be an integer" is correct, without re-deriving the condition from what a fail rate
+actually is.
+
+The second is that none of the validators checked for an empty value, and `Number('')` returns `0`
+rather than `NaN`. So `--latency ""` and `--fail-rate ""` were accepted and quietly became 0, which
+is a real setting meaning "never delay" and "never fail". `--port ""` and `--fail-status ""` were
+rejected, but only because 0 falls outside 1–65535 and outside 400–599 — the range check caught them
+by accident, not because anything asked whether a value had been supplied. Both are fixed with a
+`raw.trim() === ''` check at the top of each validator, and every message now names its own flag.
+
+**What I understood.** `parseArgs` has no concept of a required option. Every option is optional as
+far as it is concerned, and it never errors because something is missing. `--port` is optional
+because it has a `default`; `--target` is required only because `loadConfig` contains
+`if (!values.target) fail(...)`. In other words, `parseArgs` supplies defaults and my code supplies
+requirements. Because port and the three fault flags all have defaults, `raw` can never arrive as
+`undefined` in those validators — the only way to get an empty string is for someone to type
+`--port ""` explicitly.
+
+---
+
+## 2026-09-14 — Phase 1, Milestone 1.2: the fault decision ✅
+
+**The one idea:** deciding whether to perturb a request is a different job from perturbing it.
+Keeping the decision in its own pure function is what makes it testable.
+
+**What I built**, in a new file `src/fault.ts`:
+
+- `interface FaultPlan { delayMs: number, failStatus: number | null }` — what the proxy should do to
+  one request.
+- `decideFault(faults: FaultConfig, roll: number): FaultPlan` — five lines, no I/O, no randomness of
+  its own.
+
+**Three decisions.**
+
+*The roll is a parameter, not a `Math.random()` call inside the function.* A function that rolls its
+own dice cannot be tested, because every call returns a different answer. With the roll passed in,
+`decideFault(faults, 0.29)` has exactly one correct result that I can assert on. The proxy will call
+`Math.random()` and hand the number over. This is the entire reason the decision is a separate
+function rather than a few lines inside the request handler.
+
+*The comparison is `roll < failRate`, not `<=`.* `Math.random()` returns a value from 0 up to but not
+including 1. At a fail rate of 0, `roll < 0` is never true, so nothing fails. At 1, `roll < 1` is
+always true, so everything fails. Both ends come out right. With `<=`, a fail rate of 0 would fail on
+the rare occasion `Math.random()` returns exactly 0.
+
+*The plan carries a delay and a failure together, rather than being one or the other.* Someone can
+pass `--latency 2000 --fail-rate 1` and mean both. A request that is slow and then fails is the most
+useful fault this tool has, because that is what makes a client time out and retry — the behaviour
+Phases 2 and 3 exist to detect. An either/or return type would silently throw away one of the two
+flags that were typed.
+
+**How I proved it worked.** `scripts/fault-check.ts` calls `decideFault` with fixed rolls and prints
+each plan.
+
+| Config, roll | Plan returned |
+|---|---|
+| `{latencyMs:2000, failRate:0, failStatus:500}`, `0.5` | `{ delayMs: 2000, failStatus: null }` |
+| `{latencyMs:0, failRate:1, failStatus:503}`, `0.999` | `{ delayMs: 0, failStatus: 503 }` |
+| `{latencyMs:0, failRate:0.3, failStatus:500}`, `0.29` | `{ delayMs: 0, failStatus: 500 }` |
+| `{latencyMs:0, failRate:0.3, failStatus:500}`, `0.31` | `{ delayMs: 0, failStatus: null }` |
+| `{latencyMs:1000, failRate:1, failStatus:500}`, `0` | `{ delayMs: 1000, failStatus: 500 }` |
+
+That file stays in the repository. In Phase 5 it becomes the first real unit test, because the
+function was built to be callable with fixed inputs from the start.
+
+**Still not wired in.** Nothing calls `decideFault` yet. The proxy applies the plan in Milestone 1.3.
 
 ---
 

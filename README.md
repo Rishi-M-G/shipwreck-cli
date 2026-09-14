@@ -140,7 +140,7 @@ will read in Phase 3.
 
 | Event | Meaning | Fields |
 |---|---|---|
-| `proxy.listening` | The proxy bound its port | `port`, `target` |
+| `proxy.listening` | The proxy bound its port | `port`, `target`, `latencyMs`, `failRate`, `failStatus` |
 | `proxy.request.forwarded` | A request completed cleanly | `method`, `path`, `status`, `durationMs` |
 | `proxy.forward.failed` | The backend could not be reached or dropped the connection | `method`, `path`, `error` |
 | `proxy.forward.cancelled` | Shipwreck itself aborted the outbound request because the client left | `method`, `path`, `error` |
@@ -159,12 +159,27 @@ This section documents what is actually implemented, not what is planned.
 
 ```
 shipwreck --target <backend-url> [--port <number>]
+          [--latency <ms>] [--fail-rate <0..1>] [--fail-status <code>]
 ```
 
 | Flag | Required | Default | Rules |
 |---|---|---|---|
 | `--target` | yes | — | Must parse as a URL, use an `http:` or `https:` scheme, and be a bare origin with no path, query or fragment. |
 | `--port` | no | `4000` | Must be an integer between 1 and 65535. |
+| `--latency` | no | `0` | Milliseconds to delay a request before forwarding it. An integer between 0 and 300000. |
+| `--fail-rate` | no | `0` | Probability that a request is failed rather than forwarded. A number between 0 and 1 inclusive. |
+| `--fail-status` | no | `500` | The status code to return when a request is failed. An integer between 400 and 599. |
+
+**The three fault flags are parsed and validated, but no fault is applied yet.** Passing them today
+changes what the `proxy.listening` line reports and nothing else. The proxy starts acting on them in
+Milestone 1.3. This README states what is implemented, so the flags are documented here as accepted
+input rather than as working behaviour.
+
+**Why the bounds are where they are.** `--latency` is capped at five minutes because `setTimeout`
+stops waiting and fires immediately above roughly 2.1 billion milliseconds, which would turn a typo
+into a silently useless run. `--fail-status` is restricted to 400–599 because shipwreck injects
+failures, and because `res.writeHead` throws on a code outside 100–599 — a throw inside the request
+handler is the one thing a fail-soft proxy must never do, so the value is refused at startup instead.
 
 **The target must be a bare origin.** `--target http://localhost:8080` is valid; a trailing slash is
 fine. A path, query string or fragment is rejected, because your client already sends the path and a
