@@ -78,8 +78,28 @@ report that says "fail" without showing why is a report nobody trusts.
 
 ## What works today
 
-Steps 1, 4 and 6 of the pipeline above are implemented. Shipwreck forwards traffic transparently
-and reports every way that forwarding can fail.
+Shipwreck forwards traffic transparently, reports every way that forwarding can fail, and injects
+controlled network faults on demand. The verification layer — the part that makes this a resilience
+*verifier* rather than another chaos proxy — does not exist yet. That is Phases 2 and 3.
+
+**Fault injection:**
+
+- `--latency <ms>` holds a request for that long before forwarding it. The delay covers the whole
+  exchange, not just the body, because it is applied before the outbound connection is opened.
+- `--fail-rate <0..1>` gives each request that probability of being failed instead of forwarded, with
+  `--fail-status` deciding the code returned. A failed request is answered by shipwreck and **never
+  reaches the target**, which is what makes it a faithful simulation of a request lost in transit
+  rather than a backend that happens to be returning errors.
+- Both can apply to the same request. Passing `--latency 2000 --fail-rate 1` produces a request that
+  is slow and *then* fails, which is the shape that makes a real client time out and retry.
+- The injected response carries an `x-shipwreck-fault: injected` header and a JSON body naming
+  shipwreck, so an unexpected 503 in a browser's network tab is immediately traceable to this tool
+  rather than to the application under test.
+- The decision about whether to perturb a request is a pure function in `src/fault.ts`, separate from
+  the proxy that applies it, and it takes its random roll as a parameter rather than generating one.
+  That keeps it deterministically testable.
+
+**Forwarding:**
 
 - The request method, path, body and headers are relayed to the target unchanged, except for the
   `Host` header, which is rewritten to the target's host. Forwarding the browser's original `Host`
@@ -114,6 +134,16 @@ failure events, and the run exercised the things `curl` never touches:
 | Authentication across a session boundary | logged out, logged back in, dashboard reloaded |
 | Several requests issued at the same moment | four starting within 50 ms, all forwarded cleanly |
 
+Phase 1 closed against the same application. `--latency 2000` made loading states render for two
+seconds without otherwise changing behaviour. `--fail-rate 1 --fail-status 503` failed every
+application call, with the backend receiving none of them. `--fail-rate 0.5` failed roughly half the
+calls in a single page load. With no fault flags, behaviour was identical to Phase 0.
+
+That run also produced something useful without being asked to. Under an injected failure, the
+application retried once, and the two attempts were 1010 ms and 1009 ms apart across two different
+endpoints. A fixed gap rather than a growing one is a fixed-delay retry, not exponential backoff —
+exactly the kind of network-observable fact the assertion engine is being built to grade.
+
 ### The shape of a log record
 
 Every line shipwreck writes is one JSON object on stderr:
@@ -141,7 +171,10 @@ will read in Phase 3.
 | Event | Meaning | Fields |
 |---|---|---|
 | `proxy.listening` | The proxy bound its port | `port`, `target`, `latencyMs`, `failRate`, `failStatus` |
-| `proxy.request.forwarded` | A request completed cleanly | `method`, `path`, `status`, `durationMs` |
+| `proxy.request.forwarded` | A request reached the target and completed cleanly | `method`, `path`, `status`, `durationMs` |
+| `proxy.request.faulted` | Shipwreck answered the request itself; the target never saw it | `method`, `path`, `status`, `durationMs` |
+| `fault.injected` | Shipwreck delayed a request | `kind: 'latency'`, `method`, `path`, `latencyMs` |
+| `fault.injected` | Shipwreck failed a request | `kind: 'failure'`, `method`, `path`, `failStatus` |
 | `proxy.forward.failed` | The backend could not be reached or dropped the connection | `method`, `path`, `error` |
 | `proxy.forward.cancelled` | Shipwreck itself aborted the outbound request because the client left | `method`, `path`, `error` |
 | `proxy.response.failed` | The backend's response broke partway through | `method`, `path`, `error` |
@@ -152,6 +185,11 @@ looks. Both surface as `ECONNRESET` from the operating system, but one is the ba
 the other is shipwreck deliberately cancelling. Conflating them would let an impatient client
 manufacture a phantom fault, and the assertion engine would grade the application on a failure
 shipwreck invented.
+
+`proxy.request.forwarded` and `proxy.request.faulted` exist for the same reason. A delayed request is
+still genuinely forwarded and keeps the first name, with the delay included in its `durationMs`. A
+failed request never left the proxy, and recording it as forwarded would put a false statement into
+the data the assertion engine is meant to trust.
 
 ## Command-line interface
 
@@ -170,10 +208,7 @@ shipwreck --target <backend-url> [--port <number>]
 | `--fail-rate` | no | `0` | Probability that a request is failed rather than forwarded. A number between 0 and 1 inclusive. |
 | `--fail-status` | no | `500` | The status code to return when a request is failed. An integer between 400 and 599. |
 
-**The three fault flags are parsed and validated, but no fault is applied yet.** Passing them today
-changes what the `proxy.listening` line reports and nothing else. The proxy starts acting on them in
-Milestone 1.3. This README states what is implemented, so the flags are documented here as accepted
-input rather than as working behaviour.
+**`OPTIONS` requests are never faulted.** See the honest limits below for why.
 
 **Why the bounds are where they are.** `--latency` is capped at five minutes because `setTimeout`
 stops waiting and fires immediately above roughly 2.1 billion milliseconds, which would turn a typo
