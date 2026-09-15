@@ -17,12 +17,19 @@ get buried. Open questions live at the bottom of the file.
   0.1 through 0.5 are complete and verified, each with its own entry below. The gate ran my real
   React admin panel through the proxy against Spring Boot on port 8082 and the application behaved
   identically. Twenty-four requests forwarded, zero failure events.
-- **Phase 1 — Fault injection: in progress.**
-- Milestone 1.1 — The fault flags: complete and verified (14 September 2026).
-- Milestone 1.2 — The fault decision function: complete and verified (14 September 2026).
-- **Next: Milestone 1.3 — apply the plan in the proxy.** Delay before forwarding, short-circuit an
-  injected failure so the backend never sees the request, and log each injected fault. The logs have
-  to keep "I forwarded this" and "I faulted this" distinct, because Phase 2 reads them as data.
+- **PHASE 1 IS COMPLETE.** Gate passed 15 September 2026. Milestones 1.1 the fault flags, 1.2 the
+  fault decision function, 1.3 applying the fault in the proxy, and 1.4 the gate, all complete and
+  verified.
+- The gate ran my real React admin panel against Spring Boot on port 8082 through the proxy under
+  `--latency 2000`, `--fail-rate 1 --fail-status 503`, `--fail-rate 0.5`, and with no fault flags at
+  all. Every configuration changed the application's behaviour as intended, every injected fault was
+  recorded, and with the flags off nothing about Phase 0 was different.
+- **The gate produced a Phase 2 and 3 fixture I did not go looking for.** Under failure my app
+  retries once, and the gap between the two attempts is fixed at almost exactly 1009 ms rather than
+  growing. See the 1.4 entry below.
+- **Next: Phase 2 — request recording and fingerprinting.** Give every request a stable identity so
+  the same request happening twice can be detected. This is the substrate the whole verification
+  layer sits on, and it is where the project stops resembling the tools that already exist.
 ---
 
 ## Standing decisions
@@ -112,6 +119,34 @@ first.
 The honest cost: someone who redirects stdout expecting to capture the logs gets an empty file,
 because the logs are on the other channel. That is the conventional behaviour for command-line
 tools, so it is a surprise people already expect.
+
+### 2026-09-15 — CORS preflight requests are never faulted
+
+`decideFault` returns a do-nothing plan for any request whose method is `OPTIONS`. No delay, no
+injected failure. The check is the first thing the function does, before it looks at the fault
+configuration at all.
+
+A CORS preflight is the `OPTIONS` request a browser sends by itself, before certain cross-origin
+calls, to ask the server whether the real request is allowed. It is browser infrastructure, not
+application traffic, and my application never chose to send it.
+
+I found this by faulting one. With `--fail-rate 1` my login preflight came back as a 503 with no
+`access-control-allow-origin` header, so the browser refused to send the `POST` at all and reported
+a CORS error. My 503, my `x-shipwreck-fault` header and my JSON body were all received by the
+browser and all discarded, because a browser consumes a preflight response itself and never hands it
+to application code.
+
+The reason this matters beyond the error message: the request I actually wanted to test never left
+the browser. I did not observe my app handling a failed login, I observed it being unable to attempt
+one. Phase 3 grades whether the app retried, backed off, and avoided duplicating a mutation, and all
+of those need the real request to be sent. Faulting the preflight leaves nothing to grade.
+
+The check lives in `decideFault` rather than in the proxy because that function answers one
+question — should this request be perturbed, and how — and eligibility is part of that question.
+Keeping it there also keeps it unit-testable, which is why the function is separate in the first
+place.
+
+This goes in the README as an honest limit: shipwreck does not fault CORS preflight requests.
 
 ### 2026-09-09 — Phase 3 assertions must use tolerance bands, never absolute timings
 
@@ -668,6 +703,155 @@ That file stays in the repository. In Phase 5 it becomes the first real unit tes
 function was built to be callable with fixed inputs from the start.
 
 **Still not wired in.** Nothing calls `decideFault` yet. The proxy applies the plan in Milestone 1.3.
+
+---
+
+## 2026-09-15 — Phase 1, Milestone 1.3: applying the fault in the proxy ✅
+
+**The one idea:** the request handler gets two new steps before it forwards anything. It can wait,
+and it can answer the request itself instead of passing it on.
+
+**What I built**, all in `src/proxy.ts`, plus one change to `src/fault.ts`:
+
+- The `createServer` callback became `async`, and the delay uses `setTimeout` from
+  `node:timers/promises` — a built-in, so no new dependency.
+- `let upstreamRequest: ClientRequest | undefined` and all three `res.on(...)` registrations moved to
+  the top of the handler, above the pause.
+- `const plan = decideFault(config.faults, Math.random(), req.method)`. This is the only place
+  `Math.random()` is called anywhere in the project.
+- Latency: log `fault.injected` with `kind: 'latency'`, *then* `await`. Logging before the wait puts
+  the line at the moment the decision was made rather than two seconds later.
+- Failure: log `fault.injected` with `kind: 'failure'`, set `faulted = true`, write the response, and
+  `return` — so the outbound request is never created and the backend never sees it.
+- `res.on('finish')` now picks its event name from `faulted`: `proxy.request.faulted` or
+  `proxy.request.forwarded`.
+
+**Why the response handlers had to move above the `await`.** This is the part I would not have
+derived on my own and want to keep.
+
+Until this milestone the handler ran from its first line to its last without ever stopping. Node runs
+JavaScript on a single thread, so while the handler is running nothing else in the program can run
+and no event can be delivered. That made the ordering of my `res.on(...)` calls irrelevant, because
+nothing could happen in between them.
+
+`await` ends that. At `await delay(2000)` the function stops and hands control back to Node, and Node
+is then free to deliver events on `req` and `res` while my function is not running. The connection is
+still live during those two seconds, so the client can hang up.
+
+Measured, by intercepting every event on `res` while a client aborts mid-delay:
+
+```
+   19ms  handler start, awaiting 2000ms
+  514ms  CLIENT ABORTS
+  516ms  res emitted 'close'
+ 2021ms  handler resumed
+```
+
+An event is not a message that waits in a queue. It is handed to whoever is listening at the instant
+it fires, and if nobody is listening it is gone. With my `res.on('close')` registered after the
+`await`, the listener was created at 2021ms and the close had already fired at 516ms, so it never
+ran and `clientGone` stayed `false` while the client was long gone.
+
+`clientGone` is the flag that decides whether `upstreamRequest.on('error')` logs
+`proxy.forward.cancelled` or `proxy.forward.failed` — the distinction I built at Milestone 0.3 so the
+assertion engine would never grade the app on a fault shipwreck itself caused. Nothing crashes when
+that flag is wrong. It is just silently wrong, which is worse.
+
+**The rule:** register a listener before the thing it listens for can happen. That is free in a
+function that never pauses, and stops being free the moment you add an `await`. The question to carry
+elsewhere: *what can arrive while I am paused, and is anything listening for it yet?*
+
+Because those handlers now sit above the line that creates the outbound request, and because on the
+failure path that line never runs at all, `upstreamRequest` had to become
+`let upstreamRequest: ClientRequest | undefined` with `upstreamRequest?.destroy()` at the call sites.
+Both of those are consequences of the move rather than separate choices.
+
+**`writeHead` does not finish a response.** `res.writeHead(status, headers)` writes the status line
+and the headers and nothing else. Until `res.end()` runs, the connection stays open and the client
+keeps waiting. Measured, with a client that gives up after two seconds:
+
+```
+writeHead only     NO RESPONSE - client gave up after 2016ms
+writeHead + end    status 503 | body "{\"error\":\"shipwreck injected fault\"}" | after 5ms
+```
+
+`writeHead` alone does not produce a 503. It produces a timeout, which is a different fault from the
+one I meant to inject.
+
+**A line I was told to write and removed after measuring it.** The instruction was to call
+`req.resume()` on the failure path, to drain a request body that nothing would ever read. Node
+already does this: when the response finishes and nothing consumed the request, the HTTP server calls
+`req._dump()` itself. With a 5 MB upload, `req.complete` was `true` and all 5 MB had been read off
+the socket either way, and connection reuse was identical. So the line guards nothing and is gone.
+
+The rule I want from that: before adding a line whose only job is to guard against something, confirm
+the something actually happens. Defensive code that guards nothing is not free — someone has to read
+it, understand it, and be afraid to delete it.
+
+**New log events.**
+
+| Event | Fields |
+|---|---|
+| `fault.injected` | `kind: 'latency'`, `method`, `path`, `latencyMs` |
+| `fault.injected` | `kind: 'failure'`, `method`, `path`, `failStatus` |
+| `proxy.request.faulted` | `method`, `path`, `status`, `durationMs` |
+
+**Decisions made.** CORS preflight requests are never faulted — see the standing decisions section
+above.
+
+---
+
+## 2026-09-15 — Phase 1, Milestone 1.4: the gate — PHASE 1 COMPLETE ✅
+
+No new code. My real React admin panel against Spring Boot on port 8082, through the proxy, in four
+configurations.
+
+| Configuration | What happened |
+|---|---|
+| `--latency 2000` | Loading states rendered for two full seconds. The app still worked, just slowly. |
+| `--fail-rate 1 --fail-status 503` | Every application call failed with the injected 503, the `x-shipwreck-fault` header visible on the failing row in the network tab. Spring Boot received none of them. |
+| `--fail-rate 0.5` | Roughly half the calls failed and half succeeded in the same page load, which proves the roll works between the endpoints rather than only at 0 and 1. |
+| no fault flags | Identical to Phase 0. |
+
+In every run, `OPTIONS` was forwarded untouched and no faulted request was ever logged as
+`proxy.request.forwarded`.
+
+**The finding I was not looking for — and it is the raw material for Phases 2 and 3.**
+
+Under `--fail-rate 1`, my app retried the failed `GET /api/v1/panel/catalog/categories/tree`:
+
+```
+18:38:18.116  fault.injected          GET /catalog/categories/tree
+18:38:18.117  proxy.request.faulted   GET /catalog/categories/tree
+18:38:19.127  fault.injected          GET /catalog/categories/tree     <- 1010 ms later
+18:38:19.128  proxy.request.faulted   GET /catalog/categories/tree
+```
+
+And under `--fail-rate 0.5`, the same shape on a different endpoint:
+
+```
+18:39:26.776  GET /catalog/tickets?agencyId=101&page=0&size=20   faulted
+18:39:27.785  GET /catalog/tickets?agencyId=101&page=0&size=20   faulted   <- 1009 ms later
+```
+
+Three things follow, and I want all three on record before Phase 3 exists so I cannot accidentally
+tune the assertions to pass.
+
+1. **My app retries.** So `retriesOnFailure` has a real passing case available from my own
+   application rather than a contrived one.
+2. **The gap is fixed, not growing.** 1010 ms and 1009 ms. That is a fixed-delay retry, not
+   exponential backoff, so `backsOff` should **fail** on my app. That is the "real fail on bad
+   traffic" half of the Phase 3 gate, and I already have it.
+3. **It retries exactly once, then stops.** Under a permanent fault the request never succeeds, so
+   `eventuallySucceeds` has a real failing case too.
+
+All three endpoints here are `GET`, which mutates nothing, so none of this is a duplicate-mutation
+case yet. Phase 2 still needs a hand-crafted `POST` for that. What it does give me is a real,
+unstaged retry pattern from an application I did not write for the purpose.
+
+Also worth keeping from Phase 0 and still true: my app issues the same
+`GET /api/v1/panel/admin/agencies` twice on load. That is duplicate-shaped traffic that is completely
+safe, and it is exactly the false-positive case the Phase 2 detector must not flag.
 
 ---
 
